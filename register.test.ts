@@ -23,6 +23,8 @@ test('prChanges', () => {
     .toEqual(['merge: blocked → clean', 'lint: pending → fail', 'e2e: new → pending'])
   // GitHub's lazy UNKNOWN is not a change
   expect(prChanges('UNKNOWN', prev, 'BEHIND', [check('lint', 'pending'), check('tests', 'pass')])).toEqual([])
+  // a check that disappears from the rollup is not reported
+  expect(prChanges('BLOCKED', prev, 'BLOCKED', [check('lint', 'pending')])).toEqual([])
 })
 
 // the buckets gh pr checks would have given for the same rollup contexts
@@ -38,6 +40,10 @@ test('toCheck', () => {
   expect(run('COMPLETED', 'FAILURE').bucket).toBe('fail')
   expect(run('COMPLETED', 'TIMED_OUT').bucket).toBe('fail')
   expect(run('COMPLETED', 'SUCCESS')).toEqual({ name: 'ci', bucket: 'pass', link: 'https://x/1' })
+  // no conclusion after completion is a failure, not a pass
+  expect(run('COMPLETED', null).bucket).toBe('fail')
+  // control characters from GitHub never reach the terminal
+  expect(toCheck({ __typename: 'CheckRun', isRequired: true, name: 'ci\x1b[31m\n', status: 'COMPLETED', conclusion: 'SUCCESS' }).name).toBe('ci[31m')
 
   const status = (state: string) => toCheck({ __typename: 'StatusContext', isRequired: false, context: 'cov', state, targetUrl: 'https://y' })
   expect(status('SUCCESS')).toEqual({ name: 'cov', bucket: 'pass', link: 'https://y' })
@@ -53,4 +59,7 @@ test('ONLY_URLS', () => {
   expect(ONLY_URLS.test('  https://github.com/o/r/pull/1/files\nhttps://github.com/o/r/pull/2 ')).toBe(true)
   expect(ONLY_URLS.test('review https://github.com/o/r/pull/1')).toBe(false)
   expect(ONLY_URLS.test('https://github.com/o/r/pull/1 please')).toBe(false)
+  expect(ONLY_URLS.test('https://github.com/o/r/pull/1?diff=split')).toBe(true)
+  expect(ONLY_URLS.test('github.com/o/r/pull/1')).toBe(false)
+  expect(ONLY_URLS.test('https://github.com/o/r/pulls/1')).toBe(false)
 })

@@ -9,7 +9,7 @@ import type { Register } from 'claude-code'
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // a prompt that is nothing but PR URLs (one or more, any whitespace) toggles them without a model turn
 export const ONLY_URLS = new RegExp(`^\\s*(${PR_URL.source}\\S*\\s*)+$`)
-// ponytail: fixed 1 min poll, one GraphQL call per PR; a webhook if rate limits bite
+// fixed 1 min poll, one GraphQL call per PR; a webhook if rate limits bite
 const POLL_MS = 60_000
 // macOS system sounds, played with afplay when present; silent elsewhere
 const SOUND_CHANGE = '/System/Library/Sounds/Glass.aiff'
@@ -17,9 +17,9 @@ const SOUND_FAIL = '/System/Library/Sounds/Basso.aiff'
 
 type Check = { name: string; bucket: string; link: string }
 type View = { number: number; title: string; state: string; isDraft: boolean; mergeable: string; mergeStateStatus: string; reviewDecision: string }
-type Context = { __typename: string; isRequired: boolean; name?: string; status?: string; conclusion?: string; detailsUrl?: string; context?: string; state?: string; targetUrl?: string }
+type Context = { __typename: string; isRequired: boolean; name?: string; status?: string | null; conclusion?: string | null; detailsUrl?: string; context?: string; state?: string; targetUrl?: string }
 
-// one call for what `gh pr view` and two `gh pr checks` used to fetch; isRequired is per PR
+// one call replaces `gh pr view` plus `gh pr checks`; isRequired is per PR
 const QUERY = `query($o: String!, $r: String!, $n: Int!) {
   repository(owner: $o, name: $r) { pullRequest(number: $n) {
     number title state isDraft mergeable mergeStateStatus reviewDecision
@@ -33,18 +33,20 @@ const QUERY = `query($o: String!, $r: String!, $n: Int!) {
 
 // the same buckets `gh pr checks` derives: a check run is pending until COMPLETED, then its
 // conclusion decides; a commit status has only a state
+// GitHub text goes to the terminal as-is, so control characters are dropped first
+const clean = (s: string) => s.replace(/[\x00-\x1f\x7f]/g, '')
 export function toCheck(c: Context): Check {
   if (c.__typename === 'StatusContext') {
     const bucket = c.state === 'SUCCESS' ? 'pass' : c.state === 'PENDING' || c.state === 'EXPECTED' ? 'pending' : 'fail'
-    return { name: c.context ?? '', bucket, link: c.targetUrl ?? '' }
+    return { name: clean(c.context ?? ''), bucket, link: c.targetUrl ?? '' }
   }
   const bucket = c.status !== 'COMPLETED' ? 'pending'
     : c.conclusion === 'SUCCESS' || c.conclusion === 'NEUTRAL' ? 'pass'
     : c.conclusion === 'SKIPPED' ? 'skipping'
     : c.conclusion === 'CANCELLED' ? 'cancel' : 'fail'
-  return { name: c.name ?? '', bucket, link: c.detailsUrl ?? '' }
+  return { name: clean(c.name ?? ''), bucket, link: c.detailsUrl ?? '' }
 }
-type Pr = { url: string; id: string; label: string; pane: string; view?: View; required: Check[]; others: Check[]; updated?: number; error?: string; busy?: boolean }
+type Pr = { url: string; id: string; label: string; pane: string; auto?: boolean; view?: View; required: Check[]; others: Check[]; updated?: number; error?: string; busy?: boolean }
 
 const ICON: Record<string, [string, string]> = { pass: ['✓', 'green'], fail: ['✗', 'red'], pending: ['●', 'yellow'], skipping: ['○', 'gray'], cancel: ['⊘', 'red'] }
 const MERGE: Record<string, string> = { CLEAN: 'green', HAS_HOOKS: 'green', UNSTABLE: 'yellow', BEHIND: 'yellow', BLOCKED: 'red', DIRTY: 'red', DRAFT: 'gray', UNKNOWN: 'gray' }
@@ -69,11 +71,12 @@ export function prChanges(prevMerge: string | undefined, prevBuckets: Map<string
 }
 
 let flashing = false
+let poll: { cancel(): void } | undefined
 const prs = new Map<string, Pr>()
 // built in session.start, where $ is in hand; later hooks call them
 let refresh: ((pr: Pr) => Promise<void>) | undefined
 let stop: ((pr: Pr) => void) | undefined
-let watch: ((m: RegExpExecArray) => void) | undefined
+let watch: ((m: RegExpExecArray, auto?: boolean) => void) | undefined
 let openUrl: ((url: string) => void) | undefined
 
 export const register: Register = on => {
@@ -115,13 +118,19 @@ export const register: Register = on => {
       try {
         const [, owner, repo, num] = PR_URL.exec(pr.url)!
         const { stdout, stderr, exitCode } = await $.process.run(
-          ['gh', 'api', 'graphql', '-f', `query=${QUERY}`, '-F', `o=${owner}`, '-F', `r=${repo}`, '-F', `n=${num}`], { timeoutMs: 30_000 })
+          // -f keeps owner and repo as strings (a repo named 2048 would otherwise be sent as a number)
+          ['gh', 'api', 'graphql', '-f', `query=${QUERY}`, '-f', `o=${owner}`, '-f', `r=${repo}`, '-F', `n=${num}`], { timeoutMs: 30_000 })
         if (exitCode) throw new Error(stderr.trim() || `gh exited ${exitCode}`)
-        const { number, commits, ...view } = JSON.parse(stdout).data.repository.pullRequest
+        const found = JSON.parse(stdout).data?.repository?.pullRequest
+        if (!found) throw new Error('PR not found')
+        const { number, commits, ...view } = found
         const contexts: Context[] = commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? []
         const prevMerge = pr.view?.mergeStateStatus
         const prevBuckets = new Map(pr.required.map(c => [c.name, c.bucket]))
-        const v: View = { number, ...view }
+        const v: View = { number, ...view, title: clean(view.title) }
+        // a PR Claude only mentioned that is already merged or closed is not worth a line
+        if (pr.auto && prevMerge === undefined && v.state !== 'OPEN') { stop?.(pr); return }
+        if (!prs.has(pr.id)) return
         pr.view = v
         pr.required = contexts.filter(c => c.isRequired).map(toCheck)
         pr.others = contexts.filter(c => !c.isRequired).map(toCheck)
@@ -134,25 +143,26 @@ export const register: Register = on => {
           cmux(['notify', '--title', `${pr.label}: ${failed ? 'a required check failed' : 'checks changed'}`, '--body', changes.join(' · ')])
         }
       } catch (err) {
-        pr.error = String(err)
+        pr.error = err instanceof Error ? err.message : String(err)
       } finally {
         pr.busy = false
         pr.updated = $.clock.now()
         $.ui.invalidate('ui.render')
       }
     }
-    $.clock.every(POLL_MS, () => { for (const pr of prs.values()) refresh?.(pr) })
+    poll?.cancel()
+    poll = $.clock.every(POLL_MS, () => { for (const pr of prs.values()) refresh?.(pr) })
 
     stop = pr => {
       prs.delete(pr.id)
       $.ui.close({ id: pr.pane })
       $.ui.invalidate('ui.render')
     }
-    watch = ([url, owner, repo, num]) => {
+    watch = ([url, owner, repo, num], auto = false) => {
       const id = `${owner}/${repo}#${num}`
       if (prs.has(id)) return
       const pane = `pr-${repo}-${num}`.replace(/[^\w-]/g, '_').slice(0, 64)
-      const pr: Pr = { url, id, label: `${repo}#${num}`, pane, required: [], others: [] }
+      const pr: Pr = { url, id, label: `${repo}#${num}`, pane, auto, required: [], others: [] }
       prs.set(id, pr)
       refresh?.(pr)
       $.ui.invalidate('ui.render')
@@ -161,7 +171,8 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    const found = [...e.text.matchAll(new RegExp(PR_URL.source, 'g'))]
+    const seen = new Set<string>()
+    const found = [...e.text.matchAll(new RegExp(PR_URL.source, 'g'))].filter(m => !seen.has(m[0]) && seen.add(m[0]))
     if (!found.length) return next(e)
     // a prompt that is only PR URLs (one or several) toggles them without a model turn
     if (!ONLY_URLS.test(e.text)) { found.forEach(m => watch?.(m)); return next(e) }
@@ -180,15 +191,15 @@ export const register: Register = on => {
     const command = (e as { command?: unknown }).command
     if ('deny' in r || r.isError || typeof command !== 'string' || !/\bgh\s+pr\s+create\b/.test(command)) return r
     const m = PR_URL.exec((r.result as { stdout?: string } | undefined)?.stdout ?? '')
-    if (m) watch?.(m)
+    if (m) watch?.(m, true)
     return r
   })
 
   // a PR Claude mentions in its answer (one it opened through any tool, or one it was asked about)
-  // is watched too; subagent turns are skipped
+  // is watched too if it is open; subagent turns are skipped
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (!e.agentId) for (const m of e.answer.matchAll(new RegExp(PR_URL.source, 'g'))) watch?.(m)
+    if (!e.agentId) for (const m of e.answer.matchAll(new RegExp(PR_URL.source, 'g'))) watch?.(m, true)
     return r
   })
 
@@ -270,7 +281,7 @@ export const register: Register = on => {
         </Box>
         <Text bold>{pr.required.length ? `Required checks (${pr.required.length})` : 'Required checks: none reported'}</Text>
         {[...pr.required, ...optionalFails].map((c, i) => (
-          <Box flexDirection="row">
+          <Box key={c.link || c.name} flexDirection="row">
             <Box flexShrink={0}>
               <Text color={ICON[c.bucket]?.[1] ?? 'gray'}>{`${ICON[c.bucket]?.[0] ?? '?'} `}</Text>
             </Box>
