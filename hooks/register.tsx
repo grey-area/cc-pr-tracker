@@ -1,6 +1,8 @@
 /* @jsx h */
 import type { Register } from 'claude-code'
 
+import { COLS, ROWS, TICK_MS, chatFrame, runs } from './chat.ts'
+
 // A GitHub PR URL in a prompt adds a line above the prompt that polls gh for the merge state and
 // the required checks; a prompt that is only the URL toggles it without a model turn. A PR URL in
 // Claude's answer, or printed by `gh pr create`, is added too. When checks or the merge state change, it toasts,
@@ -73,8 +75,11 @@ export function prChanges(prevMerge: string | undefined, prevBuckets: Map<string
 }
 
 let flashing = false
+// Clawd and the Octocat chat above the PR lines while any watched PR still has a check running
+const isChatting = () => [...prs.values()].some(pr => [...pr.required, ...pr.others].some(c => c.bucket === 'pending'))
 let muteAll = false
 let poll: { cancel(): void } | undefined
+let ticker: { cancel(): void } | undefined
 const prs = new Map<string, Pr>()
 // Opaque session-local IDs avoid owner, punctuation and truncation collisions.
 let nextPaneId = 0
@@ -177,6 +182,8 @@ export const register: Register = on => {
         $.ui.invalidate('ui.render')
       }
     }
+    ticker?.cancel()
+    ticker = $.clock.every(TICK_MS, () => { if (isChatting()) $.ui.invalidate('ui.render') })
     poll?.cancel()
     poll = $.clock.every(POLL_MS, () => { for (const pr of prs.values()) refresh?.(pr) })
 
@@ -243,8 +250,14 @@ export const register: Register = on => {
     if (e.props.hasSurvey || (!flashing && !prs.size)) return next(e)
     const { Box, Text, Link, Button } = await $.ui.resolve(e)
     const cols = e.viewport?.columns ?? 80
+    const chat = isChatting() && cols >= COLS && e.props.maxRows >= ROWS + prs.size + (flashing ? 1 : 0) ? chatFrame(Math.floor((await $.clock.now()) / TICK_MS)) : undefined
     return (
       <Box flexDirection="column">
+        {chat ? chat.map((row, r) => (
+          <Text key={`chat:${r}`} wrap="truncate-end">
+            {runs(row).map((run, i) => <Text key={i} color={run.fg} backgroundColor={run.bg}>{run.text}</Text>)}
+          </Text>
+        )) : null}
         {flashing ? (
           <Box backgroundColor="white" width={cols}>
             <Text color="black" backgroundColor="white" bold> ● PR checks changed</Text>
