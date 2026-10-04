@@ -9,7 +9,7 @@ import type { Register } from 'claude-code'
 const PR_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/
 // a prompt that is nothing but PR URLs (one or more, any whitespace) toggles them without a model turn
 export const ONLY_URLS = new RegExp(`^\\s*(${PR_URL.source}\\S*\\s*)+$`)
-// fixed 1 min poll, one GraphQL call per PR; a webhook if rate limits bite
+// Fixed 1 min poll; check rollups are paginated in batches of 100.
 const POLL_MS = 60_000
 // macOS system sounds, played with afplay when present; silent elsewhere
 const SOUND_CHANGE = '/System/Library/Sounds/Glass.aiff'
@@ -21,11 +21,11 @@ type Check = { name: string; bucket: string; link: string }
 type View = { number: number; title: string; state: string; isDraft: boolean; mergeable: string; mergeStateStatus: string; reviewDecision: string }
 type Context = { __typename: string; isRequired: boolean; name?: string; status?: string | null; conclusion?: string | null; detailsUrl?: string; context?: string; state?: string; targetUrl?: string }
 
-// one call replaces `gh pr view` plus `gh pr checks`; isRequired is per PR
-const QUERY = `query($o: String!, $r: String!, $n: Int!) {
+// Paginated rollup replaces `gh pr view` plus `gh pr checks`; isRequired is per PR.
+const QUERY = `query($o: String!, $r: String!, $n: Int!, $after: String) {
   repository(owner: $o, name: $r) { pullRequest(number: $n) {
     number title state isDraft mergeable mergeStateStatus reviewDecision
-    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+    commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes {
       __typename
       ... on CheckRun { name status conclusion detailsUrl isRequired(pullRequestNumber: $n) }
       ... on StatusContext { context state targetUrl isRequired(pullRequestNumber: $n) }
@@ -76,6 +76,8 @@ let flashing = false
 let muteAll = false
 let poll: { cancel(): void } | undefined
 const prs = new Map<string, Pr>()
+// Opaque session-local IDs avoid owner, punctuation and truncation collisions.
+let nextPaneId = 0
 // built in session.start, where $ is in hand; later hooks call them
 let refresh: ((pr: Pr) => Promise<void>) | undefined
 let stop: ((pr: Pr) => void) | undefined
@@ -117,29 +119,49 @@ export const register: Register = on => {
     }
 
     refresh = async pr => {
-      if (pr.busy) return
+      if (pr.busy || pr.view?.state === 'MERGED' || pr.view?.state === 'CLOSED') return
       pr.busy = true
       try {
         const [, owner, repo, num] = PR_URL.exec(pr.url)!
-        const { stdout, stderr, exitCode } = await $.process.run(
-          // -f keeps owner and repo as strings (a repo named 2048 would otherwise be sent as a number)
-          ['gh', 'api', 'graphql', '-f', `query=${QUERY}`, '-f', `o=${owner}`, '-f', `r=${repo}`, '-F', `n=${num}`], { timeoutMs: 30_000 })
-        if (exitCode) throw new Error(stderr.trim() || `gh exited ${exitCode}`)
-        const found = JSON.parse(stdout).data?.repository?.pullRequest
-        if (!found) throw new Error('PR not found')
-        const { number, commits, ...view } = found
-        const contexts: Context[] = commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? []
+        const contexts: Context[] = []
+        const cursors = new Set<string>()
+        let after: string | undefined
+        let head: string | undefined
+        let v: View | undefined
+        do {
+          const args = ['gh', 'api', 'graphql', '-f', `query=${QUERY}`, '-f', `o=${owner}`, '-f', `r=${repo}`, '-F', `n=${num}`]
+          if (after !== undefined) args.push('-f', `after=${after}`)
+          const { stdout, stderr, exitCode } = await $.process.run(args, { timeoutMs: 30_000 })
+          if (exitCode) throw new Error(stderr.trim() || `gh exited ${exitCode}`)
+          const response = JSON.parse(stdout)
+          if (response.errors?.length) throw new Error('GitHub returned an incomplete GraphQL response')
+          const found = response.data?.repository?.pullRequest
+          if (!found) throw new Error('PR not found')
+          // Removing/re-adding a PR while fetching must not update its replacement.
+          if (prs.get(pr.id) !== pr) return
+          if (pr.auto && !pr.view && found.state !== 'OPEN') { stop?.(pr); return }
+          const { number, commits, ...view } = found
+          const commit = commits.nodes[0]?.commit
+          if (v && commit?.oid !== head) throw new Error('PR head changed while fetching checks; retrying next poll')
+          head = commit?.oid
+          v = { number, ...view, title: clean(view.title) }
+          const connection = commit?.statusCheckRollup?.contexts
+          contexts.push(...(connection?.nodes ?? []))
+          if (!connection?.pageInfo?.hasNextPage) break
+          const cursor = connection.pageInfo.endCursor
+          if (typeof cursor !== 'string' || !cursor || cursors.has(cursor)) throw new Error('GitHub returned an invalid check pagination cursor')
+          cursors.add(cursor)
+          after = cursor
+        } while (true)
+        const prevState = pr.view?.state
         const prevMerge = pr.view?.mergeStateStatus
         const prevBuckets = new Map(pr.required.map(c => [c.name, c.bucket]))
-        const v: View = { number, ...view, title: clean(view.title) }
-        // a PR Claude only mentioned that is already merged or closed is not worth a line
-        if (pr.auto && prevMerge === undefined && v.state !== 'OPEN') { stop?.(pr); return }
-        if (!prs.has(pr.id)) return
         pr.view = v
         pr.required = contexts.filter(c => c.isRequired).map(toCheck)
         pr.others = contexts.filter(c => !c.isRequired).map(toCheck)
         pr.error = undefined
         const changes = prChanges(prevMerge, prevBuckets, v.mergeStateStatus, pr.required)
+        if (prevState && prevState !== v.state) changes.unshift(`state: ${prevState.toLowerCase()} → ${v.state.toLowerCase()}`)
         // a muted PR (or every PR, under muteAll) still updates its line, it just never alerts
         if (changes.length && !pr.muted && !muteAll) {
           const failed = pr.required.some(c => c.bucket === 'fail' && prevBuckets.get(c.name) !== 'fail')
@@ -166,8 +188,8 @@ export const register: Register = on => {
     watch = ([url, owner, repo, num], auto = false) => {
       const id = `${owner}/${repo}#${num}`
       if (prs.has(id)) return
-      const pane = `pr-${repo}-${num}`.replace(/[^\w-]/g, '_').slice(0, 64)
-      const pr: Pr = { url, id, label: `${repo}#${num}`, pane, auto, required: [], others: [] }
+      const pane = `pr-${++nextPaneId}`
+      const pr: Pr = { url, id, label: `${owner}/${repo}#${num}`, pane, auto, required: [], others: [] }
       prs.set(id, pr)
       refresh?.(pr)
       $.ui.invalidate('ui.render')

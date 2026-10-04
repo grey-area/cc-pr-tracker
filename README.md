@@ -2,7 +2,7 @@
 
 Watch GitHub pull requests without leaving your Claude Code session.
 
-Paste a PR URL, or let Claude open one, and it gets one line above the prompt: merge state, review decision and required checks, refreshed every minute. When a check flips or the merge state moves you get a toast, a one-second flash and a sound. You keep working; the PR tells you when it needs you.
+Paste a PR URL, or let Claude open one, and it gets one line above the prompt: merge state, review decision and required checks, refreshed every minute while open. When a check flips or the merge state moves you get a toast, a one-second flash and a sound. You keep working; the PR tells you when it needs you.
 
 ![Pasting three PR URLs; each becomes a line above the prompt, then the details panel opens for one of them](docs/demo.gif)
 
@@ -106,12 +106,12 @@ Two things never alert: the first load of a PR, and a move into or out of GitHub
 
 ## Limits
 
-- Polling is every 60 seconds through `gh`, one GraphQL call per PR per poll.
+- Polling is every 60 seconds through `gh`, one GraphQL call per 100 checks. Every page is fetched; a failed page or head change keeps the previous complete snapshot and marks refresh failed.
 - Watched PRs live in memory. Restarting the session, or a plugin reload after its files change, forgets them.
 - The area above the prompt has a limited number of rows, about half the terminal. Very many PRs will scroll.
 - A headless `claude -p` run never draws. Only interactive terminal sessions show the UI.
 - A PR created in the browser or from another terminal must be pasted. Claude only auto-watches PRs whose URL appears in its answer or in `gh pr create` output.
-- Merged and closed PRs keep polling until you stop them.
+- Merged and closed PRs stay visible with their final snapshot but stop polling. A state transition alerts once unless muted. To track a reopened PR, stop watching it and add it again.
 - Only `github.com` URLs are recognised; GitHub Enterprise hosts are not.
 - GitHub's rate limit is not handled specially; a refused poll shows `refresh failed` and the next one retries.
 
@@ -124,12 +124,12 @@ The plugin is one hooks module, `hooks/register.tsx`. It hooks five events:
 - `ui.render` on `AbovePrompt` draws the lines; on `Pane` it draws the details panel.
 - `session.start` sets up a 60-second timer that polls every watched PR.
 
-Each poll is one read-only GraphQL call through `gh api graphql`: the PR's title, state, merge state and review decision, plus every check on its head commit with GitHub's own `isRequired` flag. The plugin maps check states to the same `pass` / `fail` / `pending` / `cancel` / `skipping` buckets that `gh pr checks` uses. A failed poll keeps the previous values and marks the line `refresh failed`, so a network blip is not reported as a change. Every call has a 30-second timeout.
+Each poll uses read-only, paginated GraphQL calls through `gh api graphql`: the PR's title, state, merge state and review decision, plus every check on its head commit with GitHub's own `isRequired` flag. The plugin maps check states to the same `pass` / `fail` / `pending` / `cancel` / `skipping` buckets that `gh pr checks` uses. A failed poll keeps the previous values and marks the line `refresh failed`, so a network blip is not reported as a change. Every call has a 30-second timeout.
 
 ## Develop
 
 ```sh
-bun test                              # unit tests for the pure helpers
+claude plugin test .                  # helper and hook/UI regression tests
 claude plugin validate .claude-plugin/plugin.json   # lists the hooked events and $ calls
 claude plugin validate .                            # checks the marketplace manifest
 ```

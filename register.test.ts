@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, test } from 'claude-code/testing'
 import { ONLY_URLS, linkable, prChanges, toCheck } from './hooks/register.tsx'
 
 const check = (name: string, bucket: string) => ({ name, bucket, link: '' })
