@@ -36,7 +36,7 @@ The plugin is built on Claude Code **function hooks**: TypeScript that runs insi
 2. Install from GitHub. The repo is its own marketplace:
 
    ```sh
-   claude plugin marketplace add sezaakgun/cc-pr-tracker
+   claude plugin marketplace add grey-area/cc-pr-tracker
    claude plugin install cc-pr-tracker@cc-pr-tracker
    ```
 
@@ -53,7 +53,7 @@ If the line shows `gh failed: …` instead, see [Troubleshooting](#troubleshooti
 To try it without installing, or to hack on it, clone and load it for one session:
 
 ```sh
-git clone https://github.com/sezaakgun/cc-pr-tracker
+git clone https://github.com/grey-area/cc-pr-tracker
 cd cc-pr-tracker
 claude --plugin-dir .
 ```
